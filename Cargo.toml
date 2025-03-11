@@ -1,0 +1,10 @@
+[package]
+name = "iso_file"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.40"
+thiserror = "1.0.50"
+async-recursion = "1.1.1"
+tokio = { version = "1.44.0", features = ["full"] }
