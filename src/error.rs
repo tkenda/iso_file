@@ -5,18 +5,16 @@ pub type Result<T> = std::result::Result<T, IsoFileError>;
 
 #[derive(Error, Debug)]
 pub enum IsoFileError {
-    #[error("Invalid date.")]
-    InvalidDate,
-    #[error("Invalid time.")]
-    InvalidTime,
+    #[error("Invalid datetime.")]
+    InvalidDatetime,
+    #[error("Invalid timezone")]
+    InvalidTimezone,
     #[error("File not found.")]
     FileNotFound,
     #[error("Entry is current directory.")]
     EntryCurrentDirectory,
     #[error("Entry is parent directory.")]
     EntryParentDirectory,
-    #[error("Entry is directory.")]
-    EntryDirectory,
     #[error("Std. IO: {0}.")]
     StdIo(#[from] std::io::Error),
 }
