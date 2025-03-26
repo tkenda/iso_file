@@ -5,16 +5,14 @@ use std::{mem, slice};
 
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
-use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::Result;
 use crate::types::DecDateTime;
 use crate::types::IsoDateTime;
 use crate::types::LsbMsb;
 
-const LOGICAL_BLOCK_SIZE: u16 = 2048;
+pub const LOGICAL_BLOCK_SIZE: usize = 2048;
 
 macro_rules! utf8_trimmed {
     ($field:expr) => {
@@ -26,9 +24,44 @@ macro_rules! utf8_trimmed {
     };
 }
 
+macro_rules! a_characters {
+    ($field:expr, $size:expr) => {
+        $field
+            .as_deref()
+            .map(|t| {
+                let filtered = t.chars().filter(|&c| matches!(c,
+                    'A'..='Z' | '0'..='9' | '_' |
+                    '!' | '"' | '%' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | '-' | '.' | '/' |
+                    ':' | ';' | '<' | '=' | '>' | '?')).collect::<String>();
+
+                let mut array_tmp = [0x20u8; $size];
+                let len = filtered.len().min($size);
+                array_tmp[..len].copy_from_slice(&filtered.as_bytes()[..len]);
+                array_tmp
+            })
+            .unwrap_or([0x20u8; $size])
+    };
+}
+
+macro_rules! d_characters {
+    ($field:expr, $size:expr) => {
+        $field
+            .as_deref()
+            .map(|t| {
+                let filtered = t.chars().filter(|&c| matches!(c, 'A'..='Z' | '0'..='9' | '_')).collect::<String>();
+
+                let mut array_tmp = [0x20u8; $size];
+                let len = filtered.len().min($size);
+                array_tmp[..len].copy_from_slice(&filtered.as_bytes()[..len]);
+                array_tmp
+            })
+            .unwrap_or([0x20u8; $size])
+    };
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C, packed(1))]
-struct RootDirectoryEntryRaw {
+pub(crate) struct RootDirectoryEntryRaw {
     length: u8,
     extended_attribute_length: u8,
     location_of_extent: LsbMsb<u32>,
@@ -42,9 +75,35 @@ struct RootDirectoryEntryRaw {
     file_identifier: [u8; 1],
 }
 
+#[derive(Debug)]
+
+pub(crate) struct RootDirectoryEntry {
+    pub location_of_extent: usize,
+    pub data_length: usize,
+    pub datetime: DateTime<Utc>,
+}
+
+impl RootDirectoryEntry {
+    pub(crate) fn into_raw(self) -> Result<RootDirectoryEntryRaw> {
+        Ok(RootDirectoryEntryRaw {
+            length: 34,
+            extended_attribute_length: 0,
+            location_of_extent: LsbMsb::new_u32(self.location_of_extent as u32),
+            data_length: LsbMsb::new_u32(self.data_length as u32),
+            datetime: (&self.datetime).try_into()?,
+            flags: 2,
+            unit_size: 0,
+            interleave_gap_size: 0,
+            volume_seq_number: LsbMsb::new_u16(1),
+            file_identifier_length: 1,
+            file_identifier: [0],
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct IsoHeaderRaw {
+#[repr(C, packed(1))]
+pub(crate) struct IsoHeaderRaw {
     type_code: u8,
     standard_id: [u8; 5],
     version: u8,
@@ -92,14 +151,51 @@ impl IsoHeaderRaw {
     pub fn loc_of_type_l_path_table(&self) -> u32 {
         self.loc_of_type_l_path_table * self.logical_block_size.lsb() as u32
     }
+
+    pub async fn read<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Self> {
+        let mut header_buffer = [0u8; size_of::<Self>()];
+
+        reader.read_exact(&mut header_buffer).await?;
+        let header: Self = unsafe { transmute(header_buffer) };
+
+        Ok(header)
+    }
+
+    pub async fn write<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<()> {
+        let size = mem::size_of::<Self>();
+        let ptr = self as *const Self as *const u8;
+        let byte_slice: &[u8] = unsafe { slice::from_raw_parts(ptr, size) };
+
+        writer.write_all(byte_slice).await?;
+
+        Ok(())
+    }
+
+    pub fn terminator() -> Self {
+        Self {
+            type_code: 0xff,
+            standard_id: [b'C', b'D', b'0', b'0', b'1'],
+            version: 0x01,
+            volume_creation_date: DecDateTime::zeroed(),
+            volume_modification_date: DecDateTime::zeroed(),
+            volume_expiration_date: DecDateTime::zeroed(),
+            volume_effective_date: DecDateTime::zeroed(),
+            file_structure_version: 0,
+            application_used: [0; 512],
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for IsoHeaderRaw {
     fn default() -> Self {
         Self {
-            type_code: 0,
-            standard_id: [0; 5],
-            version: 0,
+            // always 0x01 for a primary volume descriptor.
+            type_code: 0x01,
+            // always 'CD001'
+            standard_id: [b'C', b'D', b'0', b'0', b'1'],
+            // always 0x01
+            version: 0x01,
             unused00: 0,
             system_id: [0; 32],
             volumen_id: [0; 32],
@@ -126,59 +222,124 @@ impl Default for IsoHeaderRaw {
             volume_modification_date: DecDateTime::default(),
             volume_expiration_date: DecDateTime::default(),
             volume_effective_date: DecDateTime::default(),
-            file_structure_version: 0,
+            // the directory records and path table version (always 0x01).
+            file_structure_version: 1,
+            // always 0x00
             unused03: 0,
-            application_used: [0; 512],
+            application_used: [0x20; 512],
             reserved: [0; 653],
         }
     }
 }
 
-impl IsoHeaderRaw {
-    pub async fn read<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Self> {
-        let mut header_buffer = [0u8; size_of::<Self>()];
-
-        reader.read_exact(&mut header_buffer).await?;
-        let header: Self = unsafe { transmute(header_buffer) };
-
-        Ok(header)
-    }
-
-    pub fn terminator() -> Self {
-        Self {
-            type_code: 0xff,
-            standard_id: [b'C', b'D', b'0', b'0', b'1'],
-            version: 0x01,
-            ..Default::default()
-        }
-    }
+/// Wrapper around ISOHeaderRaw that provides human-readable string data
+#[derive(Debug, Clone)]
+pub struct IsoHeader {
+    pub(crate) system_id: Option<String>,
+    pub(crate) volumen_id: Option<String>,
+    pub(crate) volume_space_size: u32,
+    pub(crate) volume_set_size: u16,
+    pub(crate) volume_sequence_number: u16,
+    pub(crate) logical_block_size: u16,
+    pub(crate) path_table_size: u32,
+    pub(crate) loc_of_type_l_path_table: u32,
+    pub(crate) loc_of_opti_l_path_table: u32,
+    pub(crate) loc_of_type_m_path_table: u32,
+    pub(crate) loc_of_opti_m_path_table: u32,
+    pub(crate) volume_set_id: Option<String>,
+    pub(crate) publisher_id: Option<String>,
+    pub(crate) data_preparer_id: Option<String>,
+    pub(crate) application_id: Option<String>,
+    pub(crate) copyright_file_id: Option<String>,
+    pub(crate) abstract_file_id: Option<String>,
+    pub(crate) bibliographic_file_id: Option<String>,
+    pub(crate) volume_creation_date: Option<DateTime<Utc>>,
+    pub(crate) volume_modification_date: Option<DateTime<Utc>>,
+    pub(crate) volume_expiration_date: Option<DateTime<Utc>>,
+    pub(crate) volume_effective_date: Option<DateTime<Utc>>,
 }
 
-/// Wrapper around ISOHeaderRaw that provides human-readable string data
-#[derive(Debug)]
-pub struct IsoHeader {
-    pub system_id: Option<String>,
-    pub volumen_id: Option<String>,
-    pub volume_space_size: u32,
-    pub volume_set_size: u16,
-    pub volume_sequence_number: u16,
-    pub logical_block_size: u16,
-    pub path_table_size: u32,
-    pub loc_of_type_l_path_table: u32,
-    pub loc_of_opti_l_path_table: u32,
-    pub loc_of_type_m_path_table: u32,
-    pub loc_of_opti_m_path_table: u32,
-    pub volume_set_id: Option<String>,
-    pub publisher_id: Option<String>,
-    pub data_preparer_id: Option<String>,
-    pub application_id: Option<String>,
-    pub copyright_file_id: Option<String>,
-    pub abstract_file_id: Option<String>,
-    pub bibliographic_file_id: Option<String>,
-    pub volume_creation_date: Option<DateTime<Utc>>,
-    pub volume_modification_date: Option<DateTime<Utc>>,
-    pub volume_expiration_date: Option<DateTime<Utc>>,
-    pub volume_effective_date: Option<DateTime<Utc>>,
+impl IsoHeader {
+    pub fn set_system_id<P: Into<String>>(&mut self, system_id: P) {
+        self.system_id = Some(system_id.into());
+    }
+
+    pub fn set_volumen_id<P: Into<String>>(&mut self, volumen_id: P) {
+        self.volumen_id = Some(volumen_id.into());
+    }
+
+    pub fn set_volume_set_id<P: Into<String>>(&mut self, volume_set_id: P) {
+        self.volume_set_id = Some(volume_set_id.into());
+    }
+
+    pub fn set_publisher_id<P: Into<String>>(&mut self, publisher_id: P) {
+        self.publisher_id = Some(publisher_id.into());
+    }
+
+    pub fn set_data_preparer_id<P: Into<String>>(&mut self, data_preparer_id: P) {
+        self.data_preparer_id = Some(data_preparer_id.into());
+    }
+
+    pub fn set_application_id<P: Into<String>>(&mut self, application_id: P) {
+        self.application_id = Some(application_id.into());
+    }
+
+    pub fn set_copyright_file_id<P: Into<String>>(&mut self, copyright_file_id: P) {
+        self.copyright_file_id = Some(copyright_file_id.into());
+    }
+
+    pub fn set_abstract_file_id<P: Into<String>>(&mut self, abstract_file_id: P) {
+        self.abstract_file_id = Some(abstract_file_id.into());
+    }
+
+    pub fn set_bibliographic_file_id<P: Into<String>>(&mut self, bibliographic_file_id: P) {
+        self.bibliographic_file_id = Some(bibliographic_file_id);
+    }
+
+    pub fn set_volume_creation_date(&mut self, volume_creation_date: DateTime<Utc>) {
+        self.volume_creation_date = Some(volume_creation_date);
+    }
+
+    pub fn set_volume_modification_date(&mut self, volume_modification_date: DateTime<Utc>) {
+        self.volume_modification_date = Some(volume_modification_date);
+    }
+
+    pub fn set_volume_expiration_date(&mut self, volume_expiration_date: DateTime<Utc>) {
+        self.volume_expiration_date = Some(volume_expiration_date);
+    }
+
+    pub fn set_volume_effective_date(&mut self, volume_effective_date: DateTime<Utc>) {
+        self.volume_effective_date = Some(volume_effective_date);
+    }
+
+    pub(crate) fn into_raw(self, root_directory: RootDirectoryEntry) -> Result<IsoHeaderRaw> {
+        Ok(IsoHeaderRaw {
+            system_id: a_characters!(self.system_id, 32),
+            volumen_id: d_characters!(self.volumen_id, 32),
+            volume_space_size: LsbMsb::new_u32(self.volume_space_size),
+            volume_set_size: LsbMsb::new_u16(self.volume_set_size),
+            volume_sequence_number: LsbMsb::new_u16(self.volume_sequence_number),
+            logical_block_size: LsbMsb::new_u16(self.logical_block_size),
+            path_table_size: LsbMsb::new_u32(self.path_table_size),
+            loc_of_type_l_path_table: self.loc_of_type_l_path_table,
+            loc_of_opti_l_path_table: self.loc_of_opti_l_path_table,
+            loc_of_type_m_path_table: self.loc_of_type_m_path_table.to_be(),
+            loc_of_opti_m_path_table: self.loc_of_opti_m_path_table.to_be(),
+            root_directory_entry: root_directory.into_raw()?,
+            volume_set_id: d_characters!(self.volume_set_id, 128),
+            publisher_id: a_characters!(self.publisher_id, 128),
+            data_preparer_id: a_characters!(self.data_preparer_id, 128),
+            application_id: a_characters!(self.application_id, 128),
+            copyright_file_id: d_characters!(self.copyright_file_id, 37),
+            abstract_file_id: d_characters!(self.abstract_file_id, 37),
+            bibliographic_file_id: d_characters!(self.bibliographic_file_id, 37),
+            volume_creation_date: self.volume_creation_date.try_into()?,
+            volume_modification_date: self.volume_modification_date.try_into()?,
+            volume_expiration_date: self.volume_expiration_date.try_into()?,
+            volume_effective_date: self.volume_effective_date.try_into()?,
+            ..Default::default()
+        })
+    }
 }
 
 impl From<&IsoHeaderRaw> for IsoHeader {
@@ -224,7 +385,7 @@ impl Default for IsoHeader {
             volume_space_size: 0,
             volume_set_size: 0,
             volume_sequence_number: 0,
-            logical_block_size: LOGICAL_BLOCK_SIZE,
+            logical_block_size: LOGICAL_BLOCK_SIZE as u16,
             path_table_size: 0,
             loc_of_type_l_path_table: 0,
             loc_of_opti_l_path_table: 0,
@@ -237,10 +398,10 @@ impl Default for IsoHeader {
             copyright_file_id: None,
             abstract_file_id: None,
             bibliographic_file_id: None,
-            volume_creation_date: None,
-            volume_modification_date: None,
+            volume_creation_date: Some(Utc::now()),
+            volume_modification_date: Some(Utc::now()),
             volume_expiration_date: None,
-            volume_effective_date: None,
+            volume_effective_date: Some(Utc::now()),
         }
     }
 }
@@ -270,62 +431,6 @@ impl IsoDirectoryHeader {
         Ok(header)
     }
 
-    /*
-    pub fn new_directory() -> Self {
-
-    }
-    */
-
-    pub async fn write<W: AsyncWrite + Unpin>(
-        writer: &mut W,
-        data_offset: u32,
-        data_length: u32,
-        timestamp: &DateTime<Utc>,
-        iso_file_id: IsoEntry,
-    ) -> Result<()> {
-        let name = match iso_file_id {
-            IsoEntry::CurrentDirectory => ".".to_string(),
-            IsoEntry::ParentDirectory => "..".to_string(),
-            IsoEntry::Directory(t) => t,
-            IsoEntry::File(t) => {
-                format!("{};1", t)
-            }
-        };
-
-        let name_bytes = name.as_bytes();
-        let id_len = name_bytes.len();
-
-        let real_length = 33 + id_len as u8;
-        let length = (real_length + 1) & !1;
-        let is_odd = real_length != length;
-
-        let value = Self {
-            length,
-            extended_attribute_length: 0,
-            location_of_extent: LsbMsb::new_u32(data_offset),
-            data_length: LsbMsb::new_u32(data_length),
-            datetime: timestamp.try_into().expect("invalid date conversion"),
-            flags: 0,
-            unit_size: 1,
-            interleave_gap_size: 0,
-            volume_seq_number: LsbMsb::new_u16(256),
-            file_identifier_length: id_len as u8,
-        };
-
-        let size = mem::size_of::<Self>();
-        let ptr = &value as *const Self as *const u8;
-        let byte_slice: &[u8] = unsafe { slice::from_raw_parts(ptr, size) };
-
-        writer.write_all(byte_slice).await?;
-        writer.write_all(name_bytes).await?;
-
-        if is_odd {
-            writer.write_u8(0).await?;
-        }
-
-        Ok(())
-    }
-
     pub fn length(&self) -> u32 {
         self.length as u32
     }
@@ -338,6 +443,10 @@ impl IsoDirectoryHeader {
         self.data_length.lsb()
     }
 
+    pub fn set_data_length(&mut self, length: usize) {
+        self.data_length = LsbMsb::new_u32(length as u32);
+    }
+
     pub fn file_identifier_length(&self) -> usize {
         self.file_identifier_length as usize
     }
@@ -348,22 +457,88 @@ impl IsoDirectoryHeader {
             None => self.location_of_extent.lsb(),
         }
     }
+
+    pub fn set_location(&mut self, location: usize) {
+        self.location_of_extent = LsbMsb::new_u32(location as u32);
+    }
 }
 
-/// Represents a human-readable directory record.
 #[derive(Debug, Clone)]
 pub struct IsoDirectoryEntry {
-    pub file_id: IsoEntry,
-    pub record: IsoDirectoryHeader,
+    entry: IsoEntry,
+    record: IsoDirectoryHeader,
+    is_odd: bool,
 }
 
 impl IsoDirectoryEntry {
-    pub fn file_id(&self) -> &IsoEntry {
-        &self.file_id
+    pub(crate) fn new(
+        data_offset: usize,
+        data_length: usize,
+        timestamp: &DateTime<Utc>,
+        entry: IsoEntry,
+    ) -> Self {
+        let name = entry.name();
+        let name_bytes = name.as_bytes();
+        let id_len = name_bytes.len();
+
+        let real_length = 33 + id_len as u8;
+        let length = (real_length + 1) & !1;
+
+        let flags = if entry.is_file() { 0 } else { 2 };
+
+        Self {
+            entry,
+            record: IsoDirectoryHeader {
+                length,
+                extended_attribute_length: 0,
+                location_of_extent: LsbMsb::new_u32(data_offset as u32),
+                data_length: LsbMsb::new_u32(data_length as u32),
+                datetime: timestamp.try_into().expect("invalid date conversion"),
+                flags,
+                unit_size: 0,
+                interleave_gap_size: 0,
+                volume_seq_number: LsbMsb::new_u16(256),
+                file_identifier_length: id_len as u8,
+            },
+            is_odd: real_length != length,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.record.length as usize
+    }
+
+    pub(crate) async fn write<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<usize> {
+        let name = self.entry.name();
+        let name_bytes = name.as_bytes();
+
+        let size = mem::size_of::<IsoDirectoryHeader>();
+        let ptr = &self.record as *const IsoDirectoryHeader as *const u8;
+        let byte_slice: &[u8] = unsafe { slice::from_raw_parts(ptr, size) };
+
+        writer.write_all(byte_slice).await?;
+        writer.write_all(name_bytes).await?;
+
+        let odd_size = if self.is_odd {
+            writer.write_all(&[0]).await?;
+            1
+        } else {
+            0
+        };
+
+        Ok(byte_slice.len() + name_bytes.len() + odd_size)
+    }
+
+    pub fn entry(&self) -> &IsoEntry {
+        &self.entry
     }
 
     pub fn record(&self) -> &IsoDirectoryHeader {
         &self.record
+    }
+
+    pub fn record_mut(&mut self) -> &mut IsoDirectoryHeader {
+        &mut self.record
     }
 }
 
@@ -373,7 +548,7 @@ pub struct IsoDirectoryEntries(BTreeMap<PathBuf, IsoDirectoryEntry>);
 impl IsoDirectoryEntries {
     #[async_recursion(?Send)]
     #[allow(clippy::multiple_bound_locations)]
-    pub async fn read<R: AsyncRead + AsyncSeekExt + Unpin>(
+    pub(crate) async fn read<R: AsyncRead + AsyncSeekExt + Unpin>(
         &mut self,
         reader: &mut R,
         base: &Path,
@@ -394,26 +569,43 @@ impl IsoDirectoryEntries {
 
             offset += record.length();
 
-            let file_id = IsoEntry::from(file_id_buffer);
+            let entry = IsoEntry::from(file_id_buffer);
 
-            match file_id {
+            let is_odd = record.file_identifier_length() % 2 != 0;
+
+            match entry {
                 IsoEntry::CurrentDirectory => {
-                    _ = self
-                        .0
-                        .insert(base.join("."), IsoDirectoryEntry { file_id, record })
+                    _ = self.0.insert(
+                        base.join("."),
+                        IsoDirectoryEntry {
+                            entry,
+                            record,
+                            is_odd,
+                        },
+                    )
                 }
                 IsoEntry::ParentDirectory => {
-                    _ = self
-                        .0
-                        .insert(base.join(".."), IsoDirectoryEntry { file_id, record })
+                    _ = self.0.insert(
+                        base.join(".."),
+                        IsoDirectoryEntry {
+                            entry,
+                            record,
+                            is_odd,
+                        },
+                    )
                 }
                 IsoEntry::File(ref t) => {
-                    _ = self
-                        .0
-                        .insert(base.join(t), IsoDirectoryEntry { file_id, record })
+                    _ = self.0.insert(
+                        base.join(t),
+                        IsoDirectoryEntry {
+                            entry,
+                            record,
+                            is_odd,
+                        },
+                    )
                 }
                 IsoEntry::Directory(ref t) => {
-                    if file_id.is_directory() {
+                    if entry.is_directory() {
                         self.read(
                             reader,
                             &base.join(t),
@@ -431,10 +623,6 @@ impl IsoDirectoryEntries {
 
     pub fn get(&self, path: &Path) -> Option<&IsoDirectoryEntry> {
         self.0.get(path)
-    }
-
-    pub fn inner(&self) -> &BTreeMap<PathBuf, IsoDirectoryEntry> {
-        &self.0
     }
 }
 
@@ -466,6 +654,17 @@ impl IsoEntry {
             Self::File(_) => true,
         }
     }
+
+    pub fn name(&self) -> String {
+        match self {
+            IsoEntry::CurrentDirectory => "\0".to_string(),
+            IsoEntry::ParentDirectory => "\u{1}".to_string(),
+            IsoEntry::Directory(t) => t.to_string(),
+            IsoEntry::File(t) => {
+                format!("{};1", t)
+            }
+        }
+    }
 }
 
 impl From<Vec<u8>> for IsoEntry {
@@ -488,8 +687,8 @@ impl From<Vec<u8>> for IsoEntry {
 
 /* Path Table */
 
-#[repr(C, packed(1))]
 #[derive(Debug, Default, Clone)]
+#[repr(C, packed(1))]
 pub struct IsoPathTableEntryHeader {
     length: u8,
     extended_attribute_length: u8,
@@ -501,6 +700,24 @@ pub struct IsoPathTableEntryHeader {
 pub struct IsoPathTableEntry {
     header: IsoPathTableEntryHeader,
     directory_id: String,
+}
+
+impl IsoPathTableEntry {
+    pub fn new<S: Into<String>>(location: usize, parent_directory: usize, directory_id: S) -> Self {
+        let directory_id = directory_id.into();
+
+        let header = IsoPathTableEntryHeader {
+            length: directory_id.len() as u8,
+            extended_attribute_length: 0,
+            location_of_extent: location as u32,
+            directory_number_of_parent_directory: parent_directory as u16,
+        };
+
+        Self {
+            header,
+            directory_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -546,14 +763,73 @@ impl IsoPathTable {
         Ok(Self::LTable(entries))
     }
 
-    pub fn convert_to_m_table(&mut self) {
-        match self {
-            Self::LTable(t) => {
-                for entry in t {
-                    entry.header.location_of_extent = entry.header.location_of_extent.to_be();
+    pub fn as_vec(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        let entries = match self {
+            Self::LTable(t) => t,
+            Self::MTable(t) => t,
+        };
+
+        for entry in entries {
+            let size = mem::size_of::<IsoPathTableEntryHeader>();
+            let ptr = &entry.header as *const IsoPathTableEntryHeader as *const u8;
+            let byte_slice: &[u8] = unsafe { slice::from_raw_parts(ptr, size) };
+
+            bytes.extend_from_slice(byte_slice);
+            bytes.extend_from_slice(entry.directory_id.as_bytes());
+
+            // add one if length is odd
+            if entry.header.length & 1 != 0 {
+                bytes.push(0x0);
+            }
+        }
+
+        bytes
+    }
+
+    pub fn new_l_table(source: &[Vec<(String, usize)>]) -> Self {
+        let mut index = 1;
+        let mut folder_map = Vec::new();
+
+        let mut path_table = vec![IsoPathTableEntry::new(23, 1, "\0".to_string())];
+
+        // First level folders
+        for folder in &source[0] {
+            index += 1;
+            path_table.push(IsoPathTableEntry::new(folder.1, 1, folder.0.clone()));
+            folder_map.push((folder.clone(), index));
+        }
+
+        // Process subfolders
+        for (i, subfolders) in source.iter().skip(1).enumerate() {
+            if let Some((_, parent_index)) = folder_map.get(i) {
+                for subfolder in subfolders {
+                    index += 1;
+                    path_table.push(IsoPathTableEntry::new(
+                        subfolder.1,
+                        *parent_index,
+                        subfolder.0.clone(),
+                    ));
                 }
             }
-            Self::MTable(_) => {}
+        }
+
+        Self::LTable(path_table)
+    }
+
+    pub fn convert_to_m_table(self) -> Self {
+        match self {
+            Self::LTable(mut t) => {
+                t.iter_mut().for_each(|t| {
+                    t.header.location_of_extent = t.header.location_of_extent.to_be();
+                    t.header.directory_number_of_parent_directory =
+                        t.header.directory_number_of_parent_directory.to_be();
+                });
+
+                Self::MTable(t)
+            }
+            Self::MTable(t) => Self::MTable(t),
         }
     }
 }

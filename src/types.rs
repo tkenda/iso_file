@@ -13,10 +13,6 @@ impl<T: Copy> LsbMsb<T> {
     pub fn lsb(&self) -> T {
         self.lsb
     }
-
-    pub fn msb(&self) -> T {
-        self.msb
-    }
 }
 
 impl LsbMsb<u16> {
@@ -37,7 +33,7 @@ impl LsbMsb<u32> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
 pub(crate) struct DecDateTime {
     year: [u8; 4],
@@ -48,6 +44,36 @@ pub(crate) struct DecDateTime {
     second: [u8; 2],
     milli: [u8; 2],
     tz_offset: [u8; 1],
+}
+
+impl DecDateTime {
+    pub fn zeroed() -> Self {
+        Self {
+            year: [0x0; 4],
+            month: [0x0; 2],
+            day: [0x0; 2],
+            hour: [0x0; 2],
+            minute: [0x0; 2],
+            second: [0x0; 2],
+            milli: [0x0; 2],
+            tz_offset: [0x0],
+        }
+    }
+}
+
+impl Default for DecDateTime {
+    fn default() -> Self {
+        Self {
+            year: [b'0'; 4],
+            month: [b'0'; 2],
+            day: [b'0'; 2],
+            hour: [b'0'; 2],
+            minute: [b'0'; 2],
+            second: [b'0'; 2],
+            milli: [b'0'; 2],
+            tz_offset: [0x0],
+        }
+    }
 }
 
 impl TryInto<DateTime<Utc>> for DecDateTime {
@@ -89,7 +115,7 @@ impl TryInto<DateTime<Utc>> for DecDateTime {
 impl TryFrom<&DateTime<Utc>> for DecDateTime {
     type Error = IsoFileError;
 
-    fn try_from(value: &DateTime<Utc>) -> Result<DecDateTime> {
+    fn try_from(value: &DateTime<Utc>) -> Result<Self> {
         let year = format!("{:04}", value.year()).into_bytes();
         let month = format!("{:02}", value.month()).into_bytes();
         let day = format!("{:02}", value.day()).into_bytes();
@@ -101,7 +127,7 @@ impl TryFrom<&DateTime<Utc>> for DecDateTime {
         let offset = value.offset().fix().local_minus_utc();
         let tz_offset = (offset / (15 * 60)) as u8; // Convert seconds to 15-minute intervals
 
-        Ok(DecDateTime {
+        Ok(Self {
             year: [year[0], year[1], year[2], year[3]],
             month: [month[0], month[1]],
             day: [day[0], day[1]],
@@ -111,6 +137,25 @@ impl TryFrom<&DateTime<Utc>> for DecDateTime {
             milli: [milli[0], milli[1]],
             tz_offset: [tz_offset],
         })
+    }
+}
+
+impl TryFrom<DateTime<Utc>> for DecDateTime {
+    type Error = IsoFileError;
+
+    fn try_from(value: DateTime<Utc>) -> Result<Self> {
+        (&value).try_into()
+    }
+}
+
+impl TryFrom<Option<DateTime<Utc>>> for DecDateTime {
+    type Error = IsoFileError;
+
+    fn try_from(value: Option<DateTime<Utc>>) -> Result<Self> {
+        match value {
+            Some(t) => Ok(t.try_into()?),
+            None => Ok(DecDateTime::default()),
+        }
     }
 }
 

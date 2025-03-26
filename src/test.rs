@@ -1,5 +1,3 @@
-use std::{io::Cursor, ptr::read};
-
 use chrono::Utc;
 use tokio::fs::File;
 
@@ -7,38 +5,29 @@ use crate::{IsoFileReader, IsoFileWriter, core::IsoHeader};
 
 #[tokio::test]
 async fn main() {
-    let mut buffer = Cursor::new(Vec::new());
+    let mut buffer1 = File::create("image2.iso").await.unwrap();
 
-    let mut writer = IsoFileWriter::new(&mut buffer, IsoHeader::default())
+    let mut header = IsoHeader::default();
+    header.set_volumen_id("DICOM");
+
+    let mut writer = IsoFileWriter::new(&mut buffer1, header)
         .await
         .unwrap();
 
-    writer.append_file("/folder1/test3", b"file3", Utc::now());
-    writer.append_file("/folder2/test5", b"file5", Utc::now());
-    writer.append_file("/test1", b"file1", Utc::now());
-    writer.append_file("/folder1/test4", b"file4", Utc::now());
-    writer.append_file("/test2", b"file2", Utc::now());
-    writer.append_file("/folder2/test6", b"file6", Utc::now());
-    writer.append_file("/bibux", b"file2", Utc::now());
-    writer.append_file("/folder/folder/folder", b"file2", Utc::now());
-    writer.append_file("/bibux", b"file2", Utc::now());
-    writer.append_file("/folder8/meme", b"file2", Utc::now());
-    writer.append_file("/folder2/folder3/test6", b"file6", Utc::now());
-    writer.append_file("/folder2/folder0/test7", b"file6", Utc::now());
+    writer.append_file("/hello.txt", b"Hello, World!", Utc::now());
 
+    writer.append_file("/one/hello2.txt", b"Hello, World!", Utc::now());
+    writer.append_file("/one/hello3.txt", b"Hello, World!", Utc::now());
+
+    writer.append_file("/one/three/hello8.txt", b"Hello, World!", Utc::now());
+    writer.append_file("/one/three/hello9.txt", b"Hello, World!", Utc::now());
+
+    writer.append_file("/two/hello4.txt", b"Hello, World!", Utc::now());
+    writer.append_file("/two/hellowaka.txt", b"Hello, Worldx!", Utc::now());
 
     writer.close().await.unwrap();
 
-    /*
-    let mut file = File::open("image.iso").await.unwrap();
-    let mut reader = IsoFileReader::read(&mut file).await.unwrap();
+    let mut buffer2 = File::open("image2.iso").await.unwrap();
 
-    for entry in reader.entries().inner() {
-        println!("{:?} {:?} => {:?}", entry.1.record().location(None), entry.1.file_id(), entry.0)
-    }
-
-
-    let value = reader.read_file("/ONE/HELLO2.TXT").await.unwrap();
-    panic!("{:?} = {:?}", value, String::from_utf8_lossy(&value));
-    */
+    let reader = IsoFileReader::read(&mut buffer2).await.unwrap();
 }
